@@ -38,9 +38,8 @@ datasets rehydrate --directory ncbi_dataset
 # datasets summary genome accession $acc | jq -r "\"$acc\t\" + .reports[0].organism.organism_name"
 
 # create taxonomy using datasets command
-datasets download taxonomy taxon 4751 --children
-unzip ncbi_dataset.zip
-mkdir -p taxonomy
+datasets download taxonomy taxon 4751 --children --filename taxonomy.zip
+unzip taxonomy.zip
 
 jq -r '.taxonomy | [
     .taxId,
@@ -51,7 +50,7 @@ jq -r '.taxonomy | [
     (.classification.family.name // ""),
     (.classification.genus.name // ""),
     (.classification.species.name // "")
-] | @csv' ncbi_dataset/ncbi_dataset/data/taxonomy_report.jsonl > taxid2taxonomy.csv
+] | @csv' ncbi_dataset/data/taxonomy_report.jsonl > taxid2taxonomy.csv
 
 ####################################################
 # for each genome fasta (.fna) in ncbi_dataset/data
