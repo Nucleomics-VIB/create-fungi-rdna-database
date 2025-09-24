@@ -1,120 +1,70 @@
-#!/bin/bash
+myenv=rDNA_database
+source /opt/miniconda3/etc/profile.d/conda.sh
+conda activate ${myenv} || \
+  ( echo "# the conda environment ${myenv} was not found on this machine" ;
+    echo "# please read the top part of the script!" \
+    && exit 1 )
 
-# create conda env with required tools
-conda create -n rDNA_database -c conda-forge -c bioconda ncbi-datasets-cli barrnap itsx hmmer bedtools samtools cd-hit blast kraken2 infernal
-conda activate rDNA_database
+# datasets download genome taxon 4751 --reference --include genome,seq-report --filename ncbi-dataset.zip
+# datasets download taxonomy taxon 4751 --children --filename taxonomy.zip
+# unzip both archives for data extraction below
 
-# Download SSU and LSU rRNA HMMs from Rfam (run once)
-export BIODATA=/opt/BIODATA
-mkdir -p $BIODATA/rfam_models
-
-#1 Download the full covariance model database from Rfam's FTP site
-This will give you the concatenated file Rfam.cm containing all family models.
-wget ftp://ftp.ebi.ac.uk/pub/databases/Rfam/CURRENT/Rfam.cm.gz
-gunzip Rfam.cm.gz
-
-#2. Extract Individual Models Using infernal's cmfetch
-
-# Extract RF01960 (SSU) RF00002 (5.8S) and RF02543 (LSU) to separate files
-cmfetch Rfam.cm RF01960 > RF01960.hmm
-cmfetch Rfam.cm RF02543 > RF02543.hmm
-cmfetch Rfam.cm RF00002 > RF00002.hmm
-
-# get all fungi genomes (5232, takes time!)
-# https://www.ncbi.nlm.nih.gov/datasets/docs/v2/how-tos/genomes/large-download/
-export NCBI_API_KEY=<mykey>
-datasets download genome taxon 4751 --reference --include genome,seq-report --excluide mag --dehydrate
-
-# decompress the archive
-unzip ncbi_dataset.zip
-
-# rehydrate
-datasets rehydrate --directory ncbi_dataset
-
-# extract classification data from NCBI downlod
-# datasets summary genome accession GCF_038497785.1 | jq '.reports[0].organism | {organism_name, tax_id}'
-# datasets summary genome accession GCF_038497785.1 | jq -r '.reports[0].organism.organism_name'
-# acc=GCF_038497785.1
-# datasets summary genome accession $acc | jq -r "\"$acc\t\" + .reports[0].organism.organism_name"
-
-# create taxonomy using datasets command
-datasets download taxonomy taxon 4751 --children --filename taxonomy.zip
-unzip taxonomy.zip
-
-jq -r '.taxonomy | [
-    .taxId,
-    (.classification.kingdom.name // ""),
-    (.classification.phylum.name // ""),
-    (.classification.class.name // ""),
-    (.classification.order.name // ""),
-    (.classification.family.name // ""),
-    (.classification.genus.name // ""),
-    (.classification.species.name // "")
-] | @csv' ncbi_dataset/data/taxonomy_report.jsonl > taxid2taxonomy.csv
-
-####################################################
-# for each genome fasta (.fna) in ncbi_dataset/data
-
-# Predict rDNA genes with Barrnap
 outfolder=barrnap_results
 mkdir -p ${outfolder}
 
-for fasta in $(find . -name "*.fna"); do
+# create empty classification file
+cat /dev/null > classification.csv
+
+for fasta in $(find ncbi-dataset -name "*.fna"); do
     base=$(basename $(dirname "$fasta"))
 
     # 1. Extract classification and append to classification.csv
-	#datasets summary genome accession "$base" | jq -r "\"$base,\" + .reports[0].organism.organism_name" >> classification.csv
+    datasets summary genome accession "$base" | jq -r "\"$base,\" + .reports[0].organism.organism_name" >> classification.csv
 
-	# 2. Predict rDNA genes with Barrnap
-	barrnap --kingdom euk --threads 4 "$fasta" > "${outfolder}/${base}_barrnap_output.gff"
+    # 2. Predict rDNA genes with Barrnap
+    barrnap --kingdom euk --threads 4 "$fasta" > "${outfolder}/${base}_barrnap_output.gff"
 
-	# 3. Extract only contiguous SSU-LSU regions using Python script output
-	python scripts/find_rDNA_region.py "${outfolder}/${base}_barrnap_output.gff" > "${outfolder}/${base}_contiguous_rDNA.bed"
-    
-	# Only extract fasta if BED file is not empty
-	if [ -s "${outfolder}/${base}_contiguous_rDNA.bed" ]; then
-		bedtools getfasta -fi "$fasta" -bed "${outfolder}/${base}_contiguous_rDNA.bed" -fo "${outfolder}/${base}_extracted_rDNA.fa"
-	fi
-done	
+    # 3. Extract only contiguous SSU-LSU regions using Python script output
+    python ./find_rDNA_region.py "${outfolder}/${base}_barrnap_output.gff" > "${outfolder}/${base}_contiguous_rDNA.bed"
 
-# Compile all extracted sequences from multiple genomes into one fasta
-cat ncbi_dataset/data/*_extracted_rDNA.fa > fungal_rDNA_sequences.fa
+    #Only extract fasta if BED file is not empty
+    if [ -s "${outfolder}/${base}_contiguous_rDNA.bed" ]; then
+        bedtools getfasta -fi "$fasta" -bed "${outfolder}/${base}_contiguous_rDNA.bed" -fo "${outfolder}/${base}_extracted_rDNA.fa"
+    fi
+done
 
-# Optionally dereplicate
-cd-hit -i fungal_rDNA_sequences.fa -o fungal_rDNA_nr.fa -c 0.99 -n 5 -M 16000 -T 8
+# merge and reannotate
+cat barrnap_results/*.fa > rDNA_18S_5.8S_28S.fa
+barrnap --kingdom euk --threads 24 rDNA_18S_5.8S_28S.fa > rDNA_18S_5.8S_28S.gff
 
-# Build BLAST database
-makeblastdb -in fungal_rDNA_nr.fa -dbtype nucl -out fungal_rDNA_db
+# create csv with asm and contig IDs from fna files
+echo "assemblyID,contig_name" > ass2ctg.csv
+find ncbi_dataset/data -type f -name "*.fna" | while read -r fasta;
+do
+  assemblyID=$(basename "$(dirname "$fasta")");
+  awk -v id="$assemblyID" '/^>/ { split($1,a," "); sub(/^>/,"",a[1]); print id "," a[1] }' "$fasta";
+done >> ass2ctg.csv
 
-# Or build Kraken2 database if taxonomic annotations are available
-kraken2-build --add-to-library fungal_rDNA_nr.fa --db fungal_rDNA_kraken_db
-kraken2-build --build --db fungal_rDNA_kraken_db
+# merge ass2ctg.csv and classification into taxonomy.csv
+awk -F, '
+  BEGIN { OFS = "," }
+  NR==FNR {
+    # Loading classification.csv into memory hash
+    classification[$1] = $2
+    next
+  }
+  FNR==1 {
+    # Print header with an added taxonomy column
+    print $0, "taxonomy"
+    next
+  }
+  {
+    # Lookup taxonomy in hash, default to NA if missing
+    tax = ($1 in classification) ? classification[$1] : "NA"
+    print $0, tax
+  }
+' classification.csv ass2ctg.csv > taxonomy.csv
 
 
-
-exit 0
-
-# 3. Extract ITS regions with ITSx
-# will not work as downloaded sequences are too long for this tool which needs amplicon to search against
-#outfolder=itsx_results
-#mkdir -p ${outfolder}
-#ITSx -i "$fasta" -o "${base}_itsx_output" --preserve T --only_full T --cpu 4
-# 4. Alternatively, run HMMER against rRNA models (downloaded from Rfam)
-#outfolder=hmmsearch_results
-#mkdir -p ${outfolder}
-# Run HMMER for SSU and LSU separately
-#hmmsearch --tblout "${outfolder}/${base}_ssu_hits.tbl" rfam_models/RF01960.hmm "$fasta"
-#hmmsearch --tblout "${outfolder}/${base}_5.8S_hits.tbl" rfam_models/RF00002.hmm "$fasta"
-#hmmsearch --tblout "${outfolder}/${base}_lsu_hits.tbl" rfam_models/RF02543.hmm "$fasta"
-# Combine and parse HMMER results to find contiguous SSU-LSU regions
-#python scripts/find_rDNA_region_hmmer.py "${outfolder}/${base}_ssu_hits.tbl" "${outfolder}/${base}_lsu_hits.tbl" > "${outfolder}/${base}_contiguous_rDNA_hmmer.bed"
-# Only extract fasta if BED file is not empty
-#if [ -s "${outfolder}/${base}_contiguous_rDNA_hmmer.bed" ]; then
-#	bedtools getfasta -fi "$fasta" -bed "${outfolder}/${base}_contiguous_rDNA_hmmer.bed" -fo "${outfolder}/${base}_extracted_rRNA_hmmer.fa"
-#fi
-# 5. Extract sequences using coordinates from hmmsearch or barrnap output
-# Example for Barrnap output (already done above):
-# bedtools getfasta -fi "$fasta" -bed "${base}_barrnap_output.gff" -fo "${base}_extracted_rDNA.fa"
-# Example for HMMER output (requires conversion of .tbl to BED format):
-# (Assuming you have a script or command to convert "${base}_rRNA_hits.tbl" to BED format)
-# bedtools getfasta -fi "$fasta" -bed "${base}_rRNA_hits.bed" -fo "${base}_extracted_rRNA_hmmer.fa"
+# rename barrnap extracted sequences with taxonomy.csv
+./rename_fasta.sh rDNA_18S_5.8S_28S.fa taxonomy.csv rDNA_18S_5.8S_28S_tax.fa
