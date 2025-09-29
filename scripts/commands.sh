@@ -1,3 +1,5 @@
+#!/bin/bash
+
 myenv=rDNA_database
 source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate ${myenv} || \
